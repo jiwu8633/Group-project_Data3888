@@ -1,0 +1,113 @@
+#1.1 Data reading and expression matrix extraction
+library(GEOquery)
+file_path <- "C:/Users/admin/Desktop/GSE48060_series_matrix.txt.gz"
+gse48060 <- getGEO(filename = file_path)
+expr <- exprs(gse48060)
+pheno <- pData(gse48060)
+
+dim(expr)
+head(expr[, 1:5])
+head(pheno)
+
+#1.2 Visualization of expression level distribution and sample correlation
+boxplot(expr, las=2, outline=FALSE, main="Expression distribution across samples")
+
+library(pheatmap)
+sample_cor <- cor(expr)
+pheatmap(sample_cor, main="Sample Correlation Heatmap")
+
+expr <- exprs(gse48060)
+
+#1.3 PCA analysis and grouping labeling
+pca <- prcomp(t(expr), scale. = TRUE) 
+pca_data <- data.frame(pca$x)
+library(ggplot2)
+
+ggplot(pca_data, aes(x = PC1, y = PC2)) +
+  geom_point() +
+  theme_minimal() +
+  ggtitle("PCA of Samples")
+
+#1.4 Screen for highly variable genes and display the heat map
+top_genes <- order(apply(expr, 1, var), decreasing = TRUE)[1:1000]
+pheatmap(expr[top_genes, ], show_rownames=FALSE, show_colnames=FALSE, main="Top 1000 Most Variable Genes")
+
+group <- pData(gse48060)$`disease status:ch1`
+barplot(table(group), col = "skyblue", main = "Sample Group Counts", ylab = "Number of Samples")
+pca_data$Group <- group
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  ggtitle("PCA of Samples by Disease Status")
+
+
+group <- pData(gse48060)$`disease status:ch1`
+barplot(table(group), 
+        col = "skyblue", 
+        main = "Sample Group Counts", 
+        ylab = "Number of Samples", 
+        las = 2)  
+
+#1.5 Difference Analysis (limma)
+library(limma)
+group_clean <- gsub(" ", "_", group)
+group_clean <- gsub("/", "_", group_clean)
+group_clean <- gsub("-", "_", group_clean)
+group_factor <- factor(group_clean)
+design <- model.matrix(~0 + group_factor)
+colnames(design) <- levels(group_factor)
+fit <- lmFit(expr, design)
+contrast_matrix <- makeContrasts(
+  with_vs_without = patient_with_recurrent_events - patient_without_recurrent_events,
+  levels = design
+)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+deg <- topTable(fit2, adjust = "fdr", number = Inf)
+head(deg)
+
+deg <- topTable(fit2, adjust = "fdr", number = Inf)
+
+#1.6  Feature screening + SVM modeling
+selected_genes <- rownames(deg[deg$adj.P.Val < 0.1 & abs(deg$logFC) > 0.5, ])
+length(selected_genes)
+
+X <- t(expr[selected_genes, ])
+y <- group_clean
+keep <- y %in% c("patient_with_recurrent_events", "patient_without_recurrent_events")
+X <- X[keep, ]
+y <- y[keep]
+y <- factor(y)
+
+#1.7 SVM Classification and Evaluation
+library(e1071)
+svm_model <- svm(x = X, y = y, kernel = "linear", cross = 5)
+print(svm_model)
+
+library(e1071)
+library(caret)  
+svm_model_final <- svm(x = X, y = y, kernel = "linear")
+svm_pred <- predict(svm_model_final, X)
+conf_mat <- confusionMatrix(svm_pred, y)
+print(conf_mat)
+
+X <- as.matrix(X)
+X[!is.finite(X)] <- NA  
+good_samples <- complete.cases(X) & complete.cases(y)
+X <- X[good_samples, ]
+y <- y[good_samples]
+
+svm_model_final <- svm(x = X, y = y, kernel = "linear", probability = TRUE)
+svm_pred_prob <- predict(svm_model_final, X, probability = TRUE)
+prob <- attr(svm_pred_prob, "probabilities")
+positive_class <- "patient_with_recurrent_events"
+prob_positive <- prob[, positive_class]
+
+#1.8 ROC curve and AUC
+library(pROC)
+roc_obj <- roc(response = y, predictor = prob_positive)
+plot(roc_obj, col = "blue", lwd = 3, main = "ROC Curve - SVM Model")
+abline(a = 0, b = 1, lty = 2, col = "gray") 
+auc(roc_obj)
+
