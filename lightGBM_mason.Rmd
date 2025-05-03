@@ -1,0 +1,196 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-04-14"
+---
+
+import the package
+```{r}
+library(GEOquery)
+library(stringr)
+library(ggplot2)
+library(limma)
+library(tidyverse)
+library(caret)
+library(randomForest)
+```
+
+
+set the seed
+```{r}
+set.seed(3888)
+```
+
+
+import the data
+```{r}
+gse <- getGEO("GSE48060")
+
+gse <- gse$GSE48060_series_matrix.txt.gz
+
+
+expr_data = exprs(gse)
+pheno = pData(gse)
+feature = fData(gse)
+```
+
+
+divide the data in two group
+```{r}
+y <- ifelse(grepl("normal control", gse$title), "Control", "Stable")
+pheno$group <- y
+
+design <- model.matrix(~0 + pheno$group)
+colnames(design) <- c("Control",  "Stable")
+fit <- lmFit(expr_data, design)
+contrast.matrix <- makeContrasts(Control-Stable, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+degs <- topTable(fit2, adjust="fdr", number=Inf)
+degs
+```
+
+
+select the top 20 significant genes
+Cross Fold and use with the example with the random forest
+```{r}
+top_genes <- head(rownames(degs[order(abs(degs$logFC), decreasing = TRUE), ]), 20)
+
+
+train_data <- t(expr_data[top_genes, ])
+train_data <- as.data.frame(train_data)
+colnames(train_data) <- make.names(colnames(train_data))
+
+
+colnames(train_data)[ncol(train_data)] <- "Group"
+train_data$Group <- as.factor(pheno$group)
+
+k <- 5
+folds <- createFolds(train_data$Group, k = k, list = TRUE, returnTrain = TRUE)
+
+
+predictions <- list()
+actual <- list()
+importance <- list()
+prob_predictions <- list()
+
+
+
+for(i in 1:k) {
+  train_idx <- folds[[i]]
+  train_set <- train_data[train_idx, ]
+  test_set <- train_data[-train_idx, ]
+  
+
+  rf_model <- randomForest(Group ~ ., 
+                           data = train_set,
+                           ntree = 100,
+                           importance = TRUE)
+  
+  predictors <- setdiff(colnames(train_set), "Group")
+  pred <- predict(rf_model, test_set[, predictors])
+  pred_prob <- predict(rf_model, test_set[, predictors], type = "prob")
+  
+  predictions[[i]] <- pred
+  actual[[i]] <- test_set$Group
+  prob_predictions[[i]] <- pred_prob
+  importance[[i]] <- importance(rf_model)
+}
+
+
+all_pred <- unlist(predictions)
+all_actual <- unlist(actual)
+
+
+conf_matrix <- confusionMatrix(all_pred, all_actual)
+
+
+print("confusion matrix")
+print(conf_matrix)
+
+# show the predicted and the real value
+predicted_probs <- prob_predictions[[1]]
+true_labels <- train_data$Group[-folds[[1]]]
+
+result <- data.frame(
+  Predicted = predicted_probs,
+  RealLabel = true_labels
+)
+
+print(result)
+
+# calculate which genes have the bigger affect
+mean_importance <- do.call(rbind, importance)
+mean_importance <- apply(mean_importance, 2, mean)
+print("feature importance:")
+print(sort(mean_importance, decreasing = TRUE))
+
+
+varImpPlot(rf_model)
+```
+
+```{r}
+library(lightgbm)
+
+# 1 means Control, 0 means Stable.
+label_binary <- ifelse(train_data$Group == "Control", 0, 1)
+
+# Storing Results
+gbm_predictions <- list()
+gbm_actual <- list()
+gbm_importance <- list()
+
+for (i in 1:k) {
+  train_idx <- folds[[i]]
+  train_set <- train_data[train_idx, ]
+  test_set <- train_data[-train_idx, ]
+
+  
+  train_matrix <- as.matrix(train_set[, -ncol(train_set)])
+  test_matrix  <- as.matrix(test_set[, -ncol(test_set)])
+  train_label  <- ifelse(train_set$Group == "Control", 0, 1)
+  test_label   <- ifelse(test_set$Group == "Control", 0, 1)
+
+  dtrain <- lgb.Dataset(data = train_matrix, label = train_label)
+
+  params <- list(
+    objective = "binary",
+    metric = "binary_logloss",
+    learning_rate = 0.1,
+    num_leaves = 15,
+    verbose = -1
+  )
+
+  gbm_model <- lgb.train(params = params,
+                         data = dtrain,
+                         nrounds = 100)
+
+  # prediction
+  pred_prob <- predict(gbm_model, test_matrix)
+  pred_class <- ifelse(pred_prob > 0.5, "Stable", "Control")
+
+  gbm_predictions[[i]] <- factor(pred_class, levels = c("Control", "Stable"))
+  gbm_actual[[i]] <- factor(test_set$Group, levels = c("Control", "Stable"))
+
+  # Feature Importance
+  gbm_importance[[i]] <- lgb.importance(gbm_model)
+}
+
+# Merge prediction results
+gbm_all_pred <- unlist(gbm_predictions)
+gbm_all_actual <- unlist(gbm_actual)
+
+# Calculate the confusion matrix
+gbm_conf_matrix <- confusionMatrix(gbm_all_pred, gbm_all_actual)
+print("LightGBM Confusion Matrix:")
+print(gbm_conf_matrix)
+
+# Summarizing feature importance
+merged_importance <- do.call(rbind, gbm_importance)
+importance_summary <- merged_importance %>%
+  group_by(Feature) %>%
+  summarise(MeanGain = mean(Gain, na.rm = TRUE)) %>%
+  arrange(desc(MeanGain))
+
+print("LightGBM Feature Importance:")
+print(importance_summary)
