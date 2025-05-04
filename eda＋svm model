@@ -1,113 +1,244 @@
-#1.1 Data reading and expression matrix extraction
+#1.1 Import data
+```{r}
 library(GEOquery)
-file_path <- "C:/Users/admin/Desktop/GSE48060_series_matrix.txt.gz"
-gse48060 <- getGEO(filename = file_path)
-expr <- exprs(gse48060)
-pheno <- pData(gse48060)
+library(R.utils)
+library(reshape2)
+library(ggplot2)
+library(limma)
+library(dplyr)
 
-dim(expr)
-head(expr[, 1:5])
-head(pheno)
+set.seed(3888) # set the seed
 
-#1.2 Visualization of expression level distribution and sample correlation
-boxplot(expr, las=2, outline=FALSE, main="Expression distribution across samples")
+# import data from GEO
+gse <- getGEO("GSE48060", GSEMatrix = TRUE)
+gse <- gse[[1]]
 
+# extract expression, phenotype, and feature data
+expr_data <- exprs(gse)
+pheno <- pData(gse)
+feature <- fData(gse)
+ 
+dim(expr_data)
+head(expr_data[, 1:5])
+head(pheno$title)
+colnames(pheno)
+table(pheno$title)
+
+```
+#1.2 Divide into 2 groups
+```{r}
+# Extract group labels from sample titles
+pheno$group <- ifelse(grepl("normal control", pheno$title, ignore.case = TRUE), "Control", "Stable")
+table(pheno$group)  
+
+# Differential expression analysis using the limma package
+design <- model.matrix(~0 + pheno$group)  
+colnames(design) <- c("Control", "Stable") 
+
+fit <- lmFit(expr_data, design)  
+contrast.matrix <- makeContrasts(Control - Stable, levels = design)  
+fit2 <- contrasts.fit(fit, contrast.matrix)  
+fit2 <- eBayes(fit2)  
+
+# Output the full table of differentially expressed genes
+degs <- topTable(fit2, adjust = "fdr", number = Inf)
+head(degs)  # Display the top differentially expressed genes
+
+
+```
+
+
+#1.3 Exploratory Data Analysis (EDA)
+```{r}
+# PCA plot
+
+# Transpose expression matrix: samples × genes
+expr_t <- t(expr_data)
+
+# Run PCA
+pca <- prcomp(expr_t, scale. = TRUE)
+
+# Build PCA data frame with group labels
+pca_df <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2])
+pca_df$Group <- pheno$group
+
+# Plot
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "PCA: Control vs Stable",
+    x = "PC1",
+    y = "PC2",
+    color = "Group"
+  ) +
+  scale_color_manual(values = c("Control" = "#1f78b4", "Stable" = "#e31a1c")) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.title = element_blank()
+  )
+
+
+```
+
+
+It can be seen from the figure that there is a certain overlap between the Control and Stable groups of samples in the principal component space, but they also show a partial separation trend, suggesting that there are differences in the overall gene expression patterns between the two groups.
+
+
+```{r}
+#volcano plot data
+degs$gene <- rownames(degs)
+degs$Significance <- ifelse(degs$adj.P.Val < 0.1 & abs(degs$logFC) > 0.5, "Significant", "Not Significant")
+
+# Plot
+ggplot(degs, aes(x = logFC, y = -log10(adj.P.Val), color = Significance)) +
+  geom_point(alpha = 0.6) +
+  scale_color_manual(values = c("Significant" = "lightblue", "Not Significant" = "pink")) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Volcano Plot",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P Value",
+    color = ""
+  ) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+```
+Under the relaxed threshold (adj.P < 0.1 & |log2FC| > 0.5), a small set of genes show potential differential expression between Control and Stable groups, warranting further exploration or classification modeling.
+
+```{r}
 library(pheatmap)
-sample_cor <- cor(expr)
-pheatmap(sample_cor, main="Sample Correlation Heatmap")
 
-expr <- exprs(gse48060)
+# Select top 20 genes with largest absolute log2 fold change
+top_genes <- head(rownames(degs[order(abs(degs$logFC), decreasing = TRUE), ]), 20)
+expr_top <- expr_data[top_genes, ]  # Extract expression values for top genes
 
-#1.3 PCA analysis and grouping labeling
-pca <- prcomp(t(expr), scale. = TRUE) 
-pca_data <- data.frame(pca$x)
+# Create group annotation for samples
+annotation_col <- data.frame(Group = pheno$group)
+rownames(annotation_col) <- colnames(expr_top)
+
+# Custom color palette: blue = low, white = mid, red = high
+heat_colors <- colorRampPalette(c("navy", "white", "firebrick3"))(100)
+
+# Plot heatmap
+pheatmap(expr_top,
+         scale = "row",                   
+         annotation_col = annotation_col, 
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         fontsize_row = 10,
+         clustering_method = "complete",
+         color = heat_colors,             
+         main = "Top 20 Differentially Expressed Genes")
+
+
+```
+
+The heatmap shows that the top 20 differentially expressed genes exhibit distinguishable expression patterns between Control and Stable groups, suggesting their potential as classification features.
+
+#1.4 Cross-validation +SVM model
+```{r}
+# Load required libraries
+library(caret)
+library(e1071)
+library(pROC)
 library(ggplot2)
 
-ggplot(pca_data, aes(x = PC1, y = PC2)) +
-  geom_point() +
-  theme_minimal() +
-  ggtitle("PCA of Samples")
+set.seed(3888)
 
-#1.4 Screen for highly variable genes and display the heat map
-top_genes <- order(apply(expr, 1, var), decreasing = TRUE)[1:1000]
-pheatmap(expr[top_genes, ], show_rownames=FALSE, show_colnames=FALSE, main="Top 1000 Most Variable Genes")
+# Prepare training data using top 20 DE genes
+top_genes <- head(rownames(degs[order(abs(degs$logFC), decreasing = TRUE), ]), 20)
+train_data <- t(expr_data[top_genes, ])
+train_data <- as.data.frame(train_data)
+train_data$Group <- as.factor(pheno$group)  # Control / Stable
 
-group <- pData(gse48060)$`disease status:ch1`
-barplot(table(group), col = "skyblue", main = "Sample Group Counts", ylab = "Number of Samples")
-pca_data$Group <- group
-
-ggplot(pca_data, aes(x = PC1, y = PC2, color = Group)) +
-  geom_point(size = 3) +
-  theme_minimal() +
-  ggtitle("PCA of Samples by Disease Status")
-
-
-group <- pData(gse48060)$`disease status:ch1`
-barplot(table(group), 
-        col = "skyblue", 
-        main = "Sample Group Counts", 
-        ylab = "Number of Samples", 
-        las = 2)  
-
-#1.5 Difference Analysis (limma)
-library(limma)
-group_clean <- gsub(" ", "_", group)
-group_clean <- gsub("/", "_", group_clean)
-group_clean <- gsub("-", "_", group_clean)
-group_factor <- factor(group_clean)
-design <- model.matrix(~0 + group_factor)
-colnames(design) <- levels(group_factor)
-fit <- lmFit(expr, design)
-contrast_matrix <- makeContrasts(
-  with_vs_without = patient_with_recurrent_events - patient_without_recurrent_events,
-  levels = design
+# 5-fold CV control with ROC/AUC support
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
 )
-fit2 <- contrasts.fit(fit, contrast_matrix)
-fit2 <- eBayes(fit2)
-deg <- topTable(fit2, adjust = "fdr", number = Inf)
-head(deg)
 
-deg <- topTable(fit2, adjust = "fdr", number = Inf)
+# Train SVM model (linear kernel)
+svm_model <- train(
+  Group ~ .,
+  data = train_data,
+  method = "svmLinear",
+  trControl = ctrl,
+  metric = "ROC",  # Use AUC as evaluation metric
+  preProcess = c("center", "scale"),
+  tuneLength = 5  # Automatically tune cost parameter
+)
 
-#1.6  Feature screening + SVM modeling
-selected_genes <- rownames(deg[deg$adj.P.Val < 0.1 & abs(deg$logFC) > 0.5, ])
-length(selected_genes)
-
-X <- t(expr[selected_genes, ])
-y <- group_clean
-keep <- y %in% c("patient_with_recurrent_events", "patient_without_recurrent_events")
-X <- X[keep, ]
-y <- y[keep]
-y <- factor(y)
-
-#1.7 SVM Classification and Evaluation
-library(e1071)
-svm_model <- svm(x = X, y = y, kernel = "linear", cross = 5)
+# Print model summary
 print(svm_model)
 
-library(e1071)
-library(caret)  
-svm_model_final <- svm(x = X, y = y, kernel = "linear")
-svm_pred <- predict(svm_model_final, X)
-conf_mat <- confusionMatrix(svm_pred, y)
-print(conf_mat)
+```
 
-X <- as.matrix(X)
-X[!is.finite(X)] <- NA  
-good_samples <- complete.cases(X) & complete.cases(y)
-X <- X[good_samples, ]
-y <- y[good_samples]
+The SVM model achieved an average AUC of 0.93 under 5-fold cross-validation, indicating strong discriminative ability between Control and Stable groups using the top 20 differentially expressed genes.
 
-svm_model_final <- svm(x = X, y = y, kernel = "linear", probability = TRUE)
-svm_pred_prob <- predict(svm_model_final, X, probability = TRUE)
-prob <- attr(svm_pred_prob, "probabilities")
-positive_class <- "patient_with_recurrent_events"
-prob_positive <- prob[, positive_class]
 
-#1.8 ROC curve and AUC
+
+```{r}
 library(pROC)
-roc_obj <- roc(response = y, predictor = prob_positive)
-plot(roc_obj, col = "blue", lwd = 3, main = "ROC Curve - SVM Model")
-abline(a = 0, b = 1, lty = 2, col = "gray") 
-auc(roc_obj)
+
+
+roc_obj <- roc(
+  response = svm_model$pred$obs,          
+  predictor = svm_model$pred$Control,     
+  levels = c("Control", "Stable"),       
+  direction = ">"                        
+)
+
+# Plot the ROC curve
+plot(roc_obj,
+     col = "#1f78b4",                     
+     lwd = 2,                            
+     main = "ROC Curve - SVM Model (5-fold CV)",
+     legacy.axes = TRUE)                
+
+# Add AUC value as a legend on the plot
+legend("bottomright", 
+       legend = paste("AUC =", round(auc(roc_obj), 3)), 
+       col = "#1f78b4", 
+       lwd = 2,
+       bty = "n")                        
+
+
+
+```
+
+The caret model reported an average AUC of 0.933 based on five-fold cross-validation.
+When aggregating all cross-validated predictions and plotting a unified ROC curve, the AUC was 0.914, which remains consistent and confirms the strong discriminative performance of the model.
+
+
+```{r}
+library(caret)
+library(ggplot2)
+
+conf_mat <- confusionMatrix(svm_model$pred$pred, svm_model$pred$obs)
+cm_df <- as.data.frame(conf_mat$table)
+
+ggplot(cm_df, aes(Prediction, Reference, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6) +
+  scale_fill_gradient(low = "white", high = "#fc8d62") +
+  theme_minimal(base_size = 14) +
+  labs(title = "Confusion Matrix - SVM (5-fold CV)",
+       x = "Predicted Class", y = "Actual Class")
+
+```
+
+The confusion matrix shows that the SVM model performed well in identifying "Stable" samples (87.1% specificity), but struggled with correctly classifying "Control" samples (only 23.8% sensitivity). This imbalance may suggest overlapping expression patterns or insufficient signal in the selected features for Control samples.
+
+
+
+```{r}
+imp <- varImp(svm_model, scale = TRUE)
+plot(imp, top = 20, main = "Top Contributing Genes - SVM")
+
+```
+The variable importance plot indicates that a small subset of genes had a disproportionate impact on classification performance, especially AFFX-LysX-3_at and AFFX-DapX-3_at. These genes may serve as potential biomarkers for further investigation.
 
