@@ -1,7 +1,10 @@
 ---
 title: "Untitled"
+author: "JINGMING LYU"
+date: "2025-05-08"
 output: html_document
-date: "2025-04-14"
+editor_options: 
+  chunk_output_type: inline
 ---
 
 import the package
@@ -16,9 +19,8 @@ library(randomForest)
 ```
 
 
-set the seed
 ```{r}
-set.seed(3888)
+set.seed(04)
 ```
 
 
@@ -40,95 +42,89 @@ divide the data in two group
 y <- ifelse(grepl("normal control", gse$title), "Control", "Stable")
 pheno$group <- y
 
-design <- model.matrix(~0 + pheno$group)
-colnames(design) <- c("Control",  "Stable")
-fit <- lmFit(expr_data, design)
-contrast.matrix <- makeContrasts(Control-Stable, levels=design)
-fit2 <- contrasts.fit(fit, contrast.matrix)
-fit2 <- eBayes(fit2)
-degs <- topTable(fit2, adjust="fdr", number=Inf)
-degs
-```
-
-
-select the top 20 significant genes
-Cross Fold and use with the example with the random forest
-```{r}
-top_genes <- head(rownames(degs[order(abs(degs$logFC), decreasing = TRUE), ]), 20)
-
-
-train_data <- t(expr_data[top_genes, ])
+train_data <- t(expr_data)
 train_data <- as.data.frame(train_data)
 colnames(train_data) <- make.names(colnames(train_data))
 
-
 colnames(train_data)[ncol(train_data)] <- "Group"
 train_data$Group <- as.factor(pheno$group)
-
-k <- 5
-folds <- createFolds(train_data$Group, k = k, list = TRUE, returnTrain = TRUE)
-
-
-predictions <- list()
-actual <- list()
-importance <- list()
-prob_predictions <- list()
-
-
-
-for(i in 1:k) {
-  train_idx <- folds[[i]]
-  train_set <- train_data[train_idx, ]
-  test_set <- train_data[-train_idx, ]
-  
-
-  rf_model <- randomForest(Group ~ ., 
-                           data = train_set,
-                           ntree = 100,
-                           importance = TRUE)
-  
-  predictors <- setdiff(colnames(train_set), "Group")
-  pred <- predict(rf_model, test_set[, predictors])
-  pred_prob <- predict(rf_model, test_set[, predictors], type = "prob")
-  
-  predictions[[i]] <- pred
-  actual[[i]] <- test_set$Group
-  prob_predictions[[i]] <- pred_prob
-  importance[[i]] <- importance(rf_model)
-}
-
-
-all_pred <- unlist(predictions)
-all_actual <- unlist(actual)
-
-
-conf_matrix <- confusionMatrix(all_pred, all_actual)
-
-
-print("confusion matrix")
-print(conf_matrix)
-
-# show the predicted and the real value
-predicted_probs <- prob_predictions[[1]]
-true_labels <- train_data$Group[-folds[[1]]]
-
-result <- data.frame(
-  Predicted = predicted_probs,
-  RealLabel = true_labels
-)
-
-print(result)
-
-# calculate which genes have the bigger affect
-mean_importance <- do.call(rbind, importance)
-mean_importance <- apply(mean_importance, 2, mean)
-print("feature importance:")
-print(sort(mean_importance, decreasing = TRUE))
-
-
-varImpPlot(rf_model)
 ```
 
 
+```{r}
+k <- 5
+folds <- createFolds(train_data$Group, k = k, list = TRUE, returnTrain = TRUE)
 
+# Initialize lists to store results
+accuracies <- numeric(k)
+top_10_genes_per_fold <- list()
+predictions <- list()
+actual <- list()
+importance_list <- list()
+
+# Perform cross-validation
+for (i in 1:k) {
+  train_idx <- folds[[i]]
+  train_expr <- expr_data[, train_idx]
+  test_expr <- expr_data[, -train_idx]
+  train_pheno <- pheno[train_idx, ]
+  test_pheno <- pheno[-train_idx, ]
+  
+  # Differential expression analysis
+  design <- model.matrix(~0 + train_pheno$group)
+  colnames(design) <- c("Control", "Stable")
+  fit <- lmFit(train_expr, design)
+  contrast.matrix <- makeContrasts(Control-Stable, levels=design)
+  fit2 <- contrasts.fit(fit, contrast.matrix)
+  fit2 <- eBayes(fit2)
+  degs <- topTable(fit2, adjust="fdr", number=Inf)
+  
+  # Select top 20 genes
+  top_genes <- head(rownames(degs[order(abs(degs$logFC), decreasing = TRUE), ]), 20)
+  
+  # Prepare training and test data with selected genes
+  train_data <- t(train_expr[top_genes, ])
+  train_data <- as.data.frame(train_data)
+  colnames(train_data) <- make.names(top_genes)
+  train_data$Group <- as.factor(train_pheno$group)
+  
+  test_data <- t(test_expr[top_genes, ])
+  test_data <- as.data.frame(test_data)
+  colnames(test_data) <- make.names(top_genes)
+  test_data$Group <- as.factor(test_pheno$group)
+  
+  # Train Random Forest model
+  rf_model <- randomForest(Group ~ ., 
+                           data = train_data,
+                           ntree = 500,
+                           importance = TRUE)
+  
+  # Store importance for voting
+  importance <- importance(rf_model)[, "MeanDecreaseAccuracy"]
+  top_10_genes_per_fold[[i]] <- names(sort(importance, decreasing = TRUE)[1:10])
+  importance_list[[i]] <- importance
+  
+  # Predict on test set
+  predictors <- setdiff(colnames(train_data), "Group")
+  pred <- predict(rf_model, test_data[, predictors])
+  
+  # Store predictions and actual labels
+  predictions[[i]] <- pred
+  actual[[i]] <- test_data$Group
+  
+  # Calculate accuracy for this fold
+  conf_matrix <- confusionMatrix(pred, test_data$Group)
+  accuracies[i] <- conf_matrix$overall['Accuracy']
+}
+
+# Print accuracy for each fold
+cat("Accuracies for each fold:\n")
+for (i in 1:k) {
+  cat(sprintf("Fold %d: %.4f\n", i, accuracies[i]))
+}
+
+# Calculate and print average accuracy
+avg_accuracy <- mean(accuracies)
+cat(sprintf("Average Accuracy: %.4f\n\n", avg_accuracy))
+```
 
