@@ -1,0 +1,123 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-04-14"
+---
+
+import the package
+```{r}
+library(GEOquery)
+library(stringr)
+library(ggplot2)
+library(limma)
+library(tidyverse)
+library(caret)
+library(randomForest)
+```
+
+
+import the data
+```{r}
+gse <- getGEO("GSE48060")
+
+gse <- gse$GSE48060_series_matrix.txt.gz
+
+expr_data = exprs(gse)
+pheno = pData(gse)
+feature = fData(gse)
+```
+
+
+divide the data in two group n then partition of train n test for expr and pheno
+```{r}
+set.seed(3888)
+
+y <- ifelse(grepl("normal control", gse$title), "Control", "Stable")
+pheno$group <- y
+
+# divide the data
+train_idx <- sample(1:ncol(expr_data), 0.8 * ncol(expr_data))
+
+# expression matrix
+train_df <- expr_data[, train_idx]
+test_df <- expr_data[, -train_idx]
+
+# corresponding pheno
+train_pheno <- pheno[train_idx, , drop = FALSE]  
+test_pheno <- pheno[-train_idx, , drop = FALSE]
+
+
+design <- model.matrix(~0 + train_pheno$group)
+colnames(design) <- c("Control",  "Stable")
+fit <- lmFit(train_df, design)
+contrast.matrix <- makeContrasts(Control-Stable, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+degs <- topTable(fit2, adjust="fdr", number=Inf)
+
+# Selecting top genes based on log FC
+top_genes <- head(rownames(degs[order(abs(degs$logFC), decreasing = TRUE), ]), 20)
+
+test_genes <- data.frame(test_df[top_genes, ])
+```
+
+
+5 Fold Cross Validation 
+```{r}
+
+set.seed(3888)
+
+#X = as.matrix(t(expr_data[top_genes, ]))
+y_bin = ifelse(train_pheno$group == "Stable", 1, 0)
+data <- data.frame(t(train_df[top_genes, ]), y = as.factor(y_bin))
+
+k <- 5
+n <- nrow(data)
+folds <- sample(rep(1:k, length.out = n))
+
+all_preds <- c()
+all_actuals <- c()
+
+for (i in 1:k) {
+  # Split data
+  val_idx <- which(folds == i)
+  train_data <- data[-val_idx, ]
+  val_data <- data[val_idx, ]
+  
+  # Train logistic regression
+  model <- glm(y ~ ., data = train_data, family = binomial)
+  
+  # Predict probs on each fold
+  probs <- predict(model, newdata = val_data, type = "response")
+  preds <- ifelse(probs > 0.5, 1, 0)
+  
+  # Collect predictions and actuals
+  actuals <- as.numeric(as.character(val_data$y))
+  all_preds <- c(all_preds, preds)
+  all_actuals <- c(all_actuals, actuals)
+}
+
+library(caret)
+
+confusionMatrix(factor(all_preds, levels = c(0, 1)),
+                factor(all_actuals, levels = c(0, 1)))
+```
+Testing model on test data
+
+```{r}
+# Prep the test data
+y_bin = ifelse(test_pheno$group == "Stable", 1, 0)
+testing_data <- data.frame(t(test_df[top_genes, ]), y = as.factor(y_bin))
+
+#final_model <- glm(y ~ ., data = train_data)
+test_preds <- predict(model, newdata = testing_data)
+preds <- ifelse(test_preds > 0.5, 1, 0)
+actuals <- as.numeric(as.character(testing_data$y))
+
+predicted_factor <- factor(preds, levels = c(0, 1))
+actual_factor <- factor(actuals, levels = c(0, 1))
+
+cm <- confusionMatrix(predicted_factor, actual_factor)
+print(cm)
+```
+
