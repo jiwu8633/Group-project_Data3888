@@ -1,0 +1,596 @@
+---
+title: "Untitled"
+author: "JINGMING LYU"
+date: "2025-05-10"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+import the package
+```{r}
+library(GEOquery)
+library(limma)
+library(caret)
+library(scales)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(pROC)
+
+library(randomForest)
+library(xgboost)
+library(e1071)
+library(glmnet)
+library(lightgbm)
+```
+
+
+import two data set
+```{r}
+gse_1 <- getGEO("GSE48060")
+
+gse_1 <- gse_1$GSE48060_series_matrix.txt.gz
+expr_data_1 = exprs(gse_1)
+pheno_1 = pData(gse_1)
+feature_1 = fData(gse_1)
+
+
+gse_2 <- getGEO("GSE66360")
+
+gse_2 <- gse_2$GSE66360_series_matrix.txt.gz
+expr_data_2 = exprs(gse_2)
+pheno_2 = pData(gse_2)
+feature_2 = fData(gse_2)
+```
+
+
+test the rownames for two data set is same
+** I think we may need to write how we processing the data in the report, this will not show when run the code, 
+** remember read the comments, I write all the process I did
+```{r}
+RN_1 <- row.names(expr_data_1)
+RN_2 <- row.names(expr_data_2)
+
+# table(RN_1 == RN_2)
+```
+
+
+Processing data
+```{r}
+# sample 1 process
+sample_1 <- as.data.frame(t(expr_data_1))
+
+
+# sample_2 process
+sample_2 <- as.data.frame(t(expr_data_2))
+
+
+# combine the two data set
+merged_sample <- rbind(sample_1, sample_2)
+# merged_sample <- rbind(sample_1_normalized, sample_2_normalized)
+```
+
+
+
+boxplot for the genes distribution
+** we may need this in the report Jerry have the idea about how to make this look more beautiful; you may need change a little bit
+** this run too much time in this file, you may need to try run in a independent file
+```{r}
+# boxplot(sample_1_normalized)
+```
+
+
+
+add the group for the merged sample
+```{r}
+# the group for the sample_1
+group_1 <- ifelse(grepl("control", pheno_1$title), "Control", "MyocardialInfarction")
+# the group for the sample_2
+group_2 <- ifelse(grepl("Control", pheno_2$title), "Control", "MyocardialInfarction")
+
+
+# combine two group 
+group_merged <- c(group_1, group_2)
+```
+
+
+
+divide the data set to training group and test group, and set the seed
+```{r}
+
+set.seed(3888)
+
+train_idx <- sample(1:length(group_merged), floor(0.8*length(group_merged)))
+
+
+train_set <- merged_sample[train_idx, ]
+train_set_group_inf <- group_merged[train_idx]
+
+test_set <- merged_sample[-train_idx, ]
+test_set_group_inf <- group_merged[-train_idx]
+```
+
+
+
+the Cross-Validation, and calculate the Differential Expression Analysis for each folds.
+```{r}
+set.seed(3888)
+
+k = 5
+folds <- createFolds(train_idx, k=5, list=TRUE, returnTrain=TRUE)
+
+diff_exp <- list()
+
+# change the number of top genes we select
+# ** can change to find the value with the higher accuracy
+num_top_genes = 50
+
+top_genes <- list()
+
+for (i in 1:k) {
+  # set the train data set
+  train_cv_idx <- folds[[i]]
+  test_cv_idx <- setdiff(1:length(group_merged), train_cv_idx)
+  
+  train_cv <- train_set[train_cv_idx, ]
+  train_cv_group_inf <- group_merged[train_cv_idx]
+  
+  
+  
+  # get the toptable for each folds
+  design <- model.matrix(~0 + train_cv_group_inf)
+  colnames(design) <- c("Control", "MyocardialInfarction")
+  
+  fit <- lmFit(t(train_cv), design)
+  contrast.matrix <- makeContrasts("Control-MyocardialInfarction", levels=design)
+  fit2 <- contrasts.fit(fit, contrast.matrix)
+  fit2 <- eBayes(fit2)
+  
+  
+  degs <- topTable(fit2, adjust="fdr", number=Inf, sort.by="logFC")
+  
+  diff_exp[[i]] <- degs
+  names(diff_exp)[i] <- paste0("Fold_", i)
+  
+  top_genes[[i]] <- row.names(head(degs, num_top_genes))
+}
+```
+
+
+
+random forest model
+```{r, warning=FALSE}
+# set the deep for the tree 
+# ** can change to find the value with the higher accuracy, this may easy set the list for the num_tree and a for loop outside
+# ** you can look for the detail for each folds use this variable, I think will be some discover
+set.seed(3888)
+
+num_tree = c(50, 100, 250, 500, 1000)
+rf_acc <- matrix(data = NA, nrow = length(num_tree), ncol = k)
+rf_recall <- matrix(data = NA, nrow = length(num_tree), ncol = k)
+rf_f1 <- matrix(data = NA, nrow = length(num_tree), ncol = k)
+rf_confusion_matrices <- vector("list", length(num_tree))
+
+for (j in 1:length(num_tree)) {
+
+  for (i in 1:k) {
+    # set the train and test
+    train_cv_idx <- folds[[i]]
+    test_cv_idx <- setdiff(1:length(group_merged), train_cv_idx)
+
+    train_model <- train_set[train_cv_idx, top_genes[[i]]]
+    train_model_group_inf <- train_set_group_inf[train_cv_idx]
+    colnames(train_model) <- make.names(colnames(train_model))
+    train_model$Group <- as.factor(train_model_group_inf)
+
+    test_model <- train_set[-train_cv_idx, top_genes[[i]]]
+    test_model_group_inf <- train_set_group_inf[-train_cv_idx]
+    colnames(test_model) <- make.names(colnames(test_model))
+
+
+
+    # the random forest model
+    rf_model <- randomForest(Group ~ .,
+                           data = train_model,
+                           ntree = num_tree[j],
+                           importance = TRUE)
+
+    pred <- predict(rf_model, test_model)
+    rf_acc[j, i] <- mean(pred == test_model_group_inf)
+    rf_confusion_matrices[[j]][[i]] <- confusionMatrix(factor(pred), 
+                                                       factor(test_model_group_inf))
+    
+    rf_recall[j, i] <- rf_confusion_matrices[[j]][[i]]$byClass["Sensitivity"]
+    rf_f1[j, i] <- rf_confusion_matrices[[j]][[i]]$byClass["F1"]
+  }
+
+}
+
+
+
+row_means <- rowMeans(rf_acc, na.rm = TRUE)
+rf_max_index <- which.max(row_means)
+```
+
+
+
+XGboost model
+```{r, warning=FALSE}
+# set the parameter for the xgboost model
+# ** can change to find the value with the higher accuracy, this may easy set the list for the parameter and a for loop outside
+set.seed(3888)
+
+num_round = c(50, 100, 200)
+xgb_deep = c(10, 20, 30)
+learning_rate = c(0.05,0.1, 0.2)
+
+
+
+xgb_acc <- matrix(data = NA, nrow = length(num_round), ncol = k)
+xgb_recall <- matrix(data = NA, nrow = length(num_round), ncol = k)
+xgb_f1 <- matrix(data = NA, nrow = length(num_round), ncol = k)
+xgb_confusion_matrices <- vector("list", length(num_round))
+
+for (j in 1:length(num_round)) {
+  
+  
+  for (i in 1:k) {
+    # set the train and test
+    train_cv_idx <- folds[[i]]
+    test_cv_idx <- setdiff(1:length(group_merged), train_cv_idx)
+    
+    train_model <- train_set[train_cv_idx, top_genes[[i]]]
+    train_model_group_inf <- train_set_group_inf[train_cv_idx]
+    colnames(train_model) <- make.names(colnames(train_model))
+    train_labels <- as.numeric(as.factor(train_model_group_inf)) - 1
+    
+    test_model <- train_set[-train_cv_idx, top_genes[[i]]]
+    test_model_group_inf <- train_set_group_inf[-train_cv_idx]
+    colnames(test_model) <- make.names(colnames(test_model))
+    test_labels <- as.numeric(as.factor(test_model_group_inf)) - 1
+  
+    
+    dtrain <- xgb.DMatrix(data = as.matrix(train_model), label = train_labels)
+    dtest <- xgb.DMatrix(data = as.matrix(test_model), label = test_labels)
+    
+    
+    # XGB parameter
+    XGB_params <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    max_depth = xgb_deep[j],
+    eta = learning_rate[j]
+    )
+    
+    
+    # XGB model
+    model <- xgb.train(
+      params = XGB_params,
+      data = dtrain,
+      nrounds = num_round,
+      watchlist = list(train = dtrain, test = dtest),
+      early_stopping_rounds = 5,
+      verbose = 0
+    )
+    
+  
+    pred_probs <- predict(model, dtest)
+    pred_labels <- ifelse(pred_probs > 0.5, 1, 0)
+    
+    
+    xgb_acc[j, i] <- mean(pred_labels == test_labels)
+    xgb_confusion_matrices[[j]][[i]] <- confusionMatrix(factor(pred_labels), factor(test_labels))
+    xgb_recall[j, i] <- xgb_confusion_matrices[[j]][[i]]$byClass["Sensitivity"]
+    xgb_f1[j, i] <- xgb_confusion_matrices[[j]][[i]]$byClass["F1"]
+    
+  }
+
+}
+
+row_means <- rowMeans(xgb_acc, na.rm = TRUE)
+xgb_max_index <- which.max(row_means)
+
+```
+
+
+
+SVM model
+```{r, warning=FALSE}
+# set the parameter for the SVM model
+# ** can change to find the value with the higher accuracy, this may easy set the list for the parameter and a for loop outside
+
+set.seed(3888)
+
+svm_cost = c(0.1,1,10)
+svm_gamma = c(0.01, 0.1, 2)
+
+
+svm_acc <- matrix(data = NA, nrow = length(svm_cost), ncol = k)
+svm_recall <- matrix(data = NA, nrow = length(svm_cost), ncol = k)
+svm_f1 <- matrix(data = NA, nrow = length(svm_cost), ncol = k)
+svm_confusion_matrices <- vector("list", length(svm_cost))
+
+
+for (j in 1:length(svm_cost)) {
+
+  for (i in 1:k) {
+  
+    train_cv_idx <- folds[[i]]
+    test_cv_idx <- setdiff(1:length(group_merged), train_cv_idx)
+    
+  
+    train_model <- train_set[train_cv_idx, top_genes[[i]]]
+    train_model_group_inf <- train_set_group_inf[train_cv_idx]
+    colnames(train_model) <- make.names(colnames(train_model))
+    train_model$Group <- as.factor(train_model_group_inf)
+    
+  
+    test_model <- train_set[-train_cv_idx, top_genes[[i]]]
+    test_model_group_inf <- train_set_group_inf[-train_cv_idx]
+    colnames(test_model) <- make.names(colnames(test_model))
+    
+  
+    svm_model <- svm(Group ~ ., 
+                     data = train_model,
+                     kernel = "radial",
+                     cost = svm_cost[j],
+                     gamma = svm_gamma[j],
+                     probability = TRUE)
+    
+  
+    pred <- predict(svm_model, test_model)
+  
+
+    svm_acc[j, i] <- mean(pred == test_model_group_inf)
+    svm_confusion_matrices[[j]][[i]] <- confusionMatrix(pred, factor(test_model_group_inf))
+    svm_recall[j, i] <- svm_confusion_matrices[[j]][[i]]$byClass["Sensitivity"]
+    svm_f1[j, i] <- svm_confusion_matrices[[j]][[i]]$byClass["F1"]
+  }
+  
+}
+
+
+row_means <- rowMeans(svm_acc, na.rm = TRUE)
+svm_max_index <- which.max(row_means)
+```
+
+
+
+LASSO model
+```{r, warning=FALSE}
+# set the parameter for the LASSO model
+# ** can change to find the value with the higher accuracy, this may easy set the list for the parameter and a for loop outside
+
+set.seed(3888)
+
+lasso_alpha <- c(0,0.5,1)
+
+
+lasso_acc <- matrix(data = NA, nrow = length(lasso_alpha), ncol = k)
+lasso_recall <- matrix(data = NA, nrow = length(lasso_alpha), ncol = k)
+lasso_f1 <- matrix(data = NA, nrow = length(lasso_alpha), ncol = k)
+lasso_confusion_matrices <- vector("list", length(lasso_alpha))
+
+for (j in 1:length(lasso_alpha)) {
+
+  for (i in 1:k) {
+  
+    train_cv_idx <- folds[[i]]
+    test_cv_idx <- setdiff(1:length(group_merged), train_cv_idx)
+    
+  
+    train_model <- train_set[train_cv_idx, top_genes[[i]]]
+    train_model_group_inf <- train_set_group_inf[train_cv_idx]
+    colnames(train_model) <- make.names(colnames(train_model))
+    train_model$Group <- as.factor(train_model_group_inf)
+    
+    
+    test_model <- train_set[-train_cv_idx, top_genes[[i]]]
+    test_model_group_inf <- train_set_group_inf[-train_cv_idx]
+    colnames(test_model) <- make.names(colnames(test_model))
+    
+  
+    x_train <- as.matrix(train_model[, !names(train_model) %in% "Group"])
+    y_train <- train_model$Group
+    x_test <- as.matrix(test_model)
+    
+  
+    lasso_model <- cv.glmnet(
+      x = x_train,
+      y = y_train,
+      family = "multinomial",
+      alpha = lasso_alpha[j],
+    )
+    
+  
+    pred <- predict(lasso_model, newx = x_test, s = "lambda.min", type = "class")
+    pred <- factor(pred, levels = levels(y_train))
+    
+    lasso_acc[j, i] <- mean(pred == test_model_group_inf)
+    lasso_confusion_matrices[[j]][[i]] <- confusionMatrix(pred,factor(test_model_group_inf))
+    lasso_recall[j, i] <- lasso_confusion_matrices[[j]][[i]]$byClass["Sensitivity"]
+    lasso_f1[j, i] <- lasso_confusion_matrices[[j]][[i]]$byClass["F1"]
+  }
+}
+
+
+row_means <- rowMeans(lasso_acc, na.rm = TRUE)
+lasso_max_index <- which.max(row_means)
+```
+
+
+
+light_gbm model
+```{r}
+# set the parameter for the light_gbm model
+# ** can change to find the value with the higher accuracy, this may easy set the list for the parameter and a for loop outside
+
+set.seed(3888)
+
+num_boost_round = c(100, 200, 500)
+
+lgbm_acc <- matrix(data = NA, nrow = length(num_boost_round), ncol = k)
+lgbm_recall <- matrix(data = NA, nrow = length(num_boost_round), ncol = k)
+lgbm_f1 <- matrix(data = NA, nrow = length(num_boost_round), ncol = k)
+lgbm_confusion_matrices <- vector("list", length(num_boost_round))
+
+for (j in 1:length(num_boost_round)) {
+  
+  
+  for (i in 1:k) {
+  
+    train_cv_idx <- folds[[i]]
+    test_cv_idx <- setdiff(1:length(group_merged), train_cv_idx)
+    
+    train_model <- train_set[train_cv_idx, top_genes[[i]]]
+    train_model_group_inf <- train_set_group_inf[train_cv_idx]
+    colnames(train_model) <- make.names(colnames(train_model))
+  
+    test_model <- train_set[-train_cv_idx, top_genes[[i]]]
+    test_model_group_inf <- train_set_group_inf[-train_cv_idx]
+    colnames(test_model) <- make.names(colnames(test_model))
+  
+    dtrain <- lgb.Dataset(data = as.matrix(train_model),
+                          label = as.numeric(as.factor(train_model_group_inf)) - 1)
+    
+    dtest <- as.matrix(test_model)
+    test_label <- as.numeric(as.factor(test_model_group_inf)) - 1
+    
+  
+    lgbm_params <- list(
+    objective = "multiclass",
+    num_class = 2,
+    metric = "multi_error",
+    verbosity = -1
+    )
+    
+  
+    lgbm_model <- lgb.train(
+      params = lgbm_params,
+      data = dtrain,
+      nrounds = num_boost_round[j],
+      verbose = -1
+    )
+    
+  
+    pred_probs <- predict(lgbm_model, dtest)
+    pred_matrix <- matrix(pred_probs, ncol = length(unique(train_model_group_inf)), byrow = TRUE)
+    pred_labels <- max.col(pred_matrix)
+    
+    true_labels <- as.numeric(as.factor(test_model_group_inf))
+
+    
+    lgbm_acc[j, i] <- mean(pred_labels == true_labels)
+    lgbm_confusion_matrices[[j]][[i]] <- confusionMatrix(factor(pred_labels), 
+                                                         factor(true_labels))
+    lgbm_recall[j, i] <- lgbm_confusion_matrices[[j]][[i]]$byClass["Sensitivity"]
+    lgbm_f1[j, i] <- lgbm_confusion_matrices[[j]][[i]]$byClass["F1"]
+  }
+}
+
+
+row_means <- rowMeans(lgbm_acc, na.rm = TRUE)
+lgbm_max_index <- which.max(row_means)
+```
+
+
+
+accuarcy for each model
+```{r}
+acc_data <- data.frame(
+  Model = c("RF", "XGB", "SVM", "Lasso", "LGBM"),
+  Mean_Accuracy = c(mean(rf_acc[rf_max_index,]), mean(xgb_acc[xgb_max_index,]), 
+                    mean(svm_acc[svm_max_index,]), mean(lasso_acc[lasso_max_index,]), 
+                    mean(lgbm_acc[lgbm_max_index,])),
+  
+  SD_Accuracy = c(sd(rf_acc[rf_max_index,]), sd(xgb_acc[xgb_max_index,]), 
+                  sd(svm_acc[svm_max_index,]), sd(lasso_acc[lasso_max_index,]), 
+                  sd(lgbm_acc[lgbm_max_index,])),
+  
+  Recall = c(mean(rf_recall[rf_max_index,]), mean(xgb_recall[xgb_max_index,]), 
+             mean(svm_recall[svm_max_index,]), mean(lasso_recall[lasso_max_index,]), 
+             mean(lgbm_recall[lgbm_max_index,])),
+  
+  F1 = c(mean(rf_f1[rf_max_index,]), mean(xgb_f1[xgb_max_index,]), 
+         mean(svm_f1[svm_max_index,]), mean(lasso_f1[lasso_max_index,]), 
+         mean(lgbm_f1[lgbm_max_index,]))
+)
+
+acc_data$Mean_Accuracy <- round(acc_data$Mean_Accuracy, 4)
+acc_data$SD_Accuracy <- round(acc_data$SD_Accuracy, 4)
+acc_data$Recall <- round(acc_data$Recall, 4)
+acc_data$F1 <- round(acc_data$F1, 4)
+
+acc_data <- acc_data[order(-acc_data$Mean_Accuracy, acc_data$SD_Accuracy), ]
+
+# sigmoid function use to project the 1/sd value
+sigmoid <- function(x, k = 50, c = mean(acc_data$SD_Accuracy)) {
+  1 / (1 + exp(k * (x - c)))
+}
+
+# Sigmoid to project 1/sd
+acc_data <- acc_data %>%
+  mutate(Stability_Score = sigmoid(SD_Accuracy))
+
+
+acc_data_long <- acc_data %>%
+  select(Model, Mean_Accuracy, Stability_Score, Recall, F1) %>%
+  rename(
+    Accuracy = Mean_Accuracy,
+    `projection 1/SD` = Stability_Score
+  ) %>%
+  pivot_longer(cols = -Model, names_to = "Metric", values_to = "Value") %>%
+  mutate(Metric = factor(Metric, levels = c("Accuracy", "projection 1/SD", "Recall", "F1")))
+
+
+ggplot(acc_data_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Model Performance Comparison (with Sigmoid-Stabilized SD)",
+       y = "Score",
+       x = "Model") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2")
+```
+
+
+
+final model
+```{r}
+design <- model.matrix(~0 + train_set_group_inf)
+colnames(design) <- c("Control", "MyocardialInfarction")
+
+fit <- lmFit(t(train_set), design)
+contrast.matrix <- makeContrasts("Control-MyocardialInfarction", levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+
+degs <- topTable(fit2, adjust="fdr", number=Inf, sort.by="logFC")
+final_top_genes <- row.names(head(degs, num_top_genes))
+
+
+final_train <- train_set[ , final_top_genes]
+colnames(final_train) <- make.names(colnames(final_train))
+final_train$Group <- as.factor(train_set_group_inf)
+
+final_test <- test_set[ , final_top_genes]
+colnames(final_test) <- make.names(colnames(final_test))
+
+
+
+
+f_num_tree = 50
+
+final_model <- randomForest(Group ~ .,
+                           data = final_train,
+                           ntree = f_num_tree,
+                           importance = TRUE)
+
+
+final_pred <- predict(final_model, final_test)
+f_rf_acc <- mean(final_pred == test_set_group_inf)
+f_rf_cm <- confusionMatrix(factor(final_pred), factor(test_set_group_inf))
+f_rf_acc
+```

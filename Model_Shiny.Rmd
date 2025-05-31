@@ -1,0 +1,213 @@
+---
+title: "Untitled"
+author: "JINGMING LYU"
+date: "2025-05-17"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+import the package
+```{r}
+library(GEOquery)
+library(limma)
+library(caret)
+library(scales)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(pROC)
+
+library(randomForest)
+```
+
+
+import two data set
+```{r}
+gse_1 <- getGEO("GSE48060")
+
+gse_1 <- gse_1$GSE48060_series_matrix.txt.gz
+expr_data_1 = exprs(gse_1)
+pheno_1 = pData(gse_1)
+feature_1 = fData(gse_1)
+
+
+gse_2 <- getGEO("GSE66360")
+
+gse_2 <- gse_2$GSE66360_series_matrix.txt.gz
+expr_data_2 = exprs(gse_2)
+pheno_2 = pData(gse_2)
+feature_2 = fData(gse_2)
+```
+
+
+
+
+Processing data
+```{r}
+# sample 1 process
+sample_1 <- as.data.frame(t(expr_data_1))
+
+probe_ids_1 <- colnames(sample_1)
+matched_symbols_1 <- feature_1[probe_ids_1, "Gene Symbol"]
+colnames(sample_1) <- make.names(matched_symbols_1)
+
+
+# sample_2 process
+sample_2 <- as.data.frame(t(expr_data_2))
+
+probe_ids_2 <- colnames(sample_2)
+matched_symbols_2 <- feature_2[probe_ids_2, "Gene Symbol"]
+colnames(sample_2) <- make.names(matched_symbols_2)
+
+
+
+# combine the two data set
+common_genes <- intersect(colnames(sample_1), colnames(sample_2))
+sample_1 <- sample_1[, common_genes]
+sample_2 <- sample_2[, common_genes]
+merged_sample <- rbind(sample_1, sample_2)
+```
+
+
+
+add the group for the merged sample
+```{r}
+# the group for the sample_1
+group_1 <- ifelse(grepl("control", pheno_1$title), "Control", "MyocardialInfarction")
+# the group for the sample_2
+group_2 <- ifelse(grepl("Control", pheno_2$title), "Control", "MyocardialInfarction")
+
+# combine two group 
+group_merged <- c(group_1, group_2)
+
+
+
+num_top_genes = 50
+```
+
+
+
+final model
+```{r, warning=FALSE}
+design <- model.matrix(~0 + group_merged)
+colnames(design) <- c("Control", "MyocardialInfarction")
+fit <- lmFit(t(merged_sample), design) 
+contrast.matrix <- makeContrasts("Control-MyocardialInfarction", levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+
+degs <- topTable(fit2, adjust="fdr", number=Inf, sort.by="logFC")
+final_top_genes <- row.names(head(degs, num_top_genes))
+
+
+final_train <- merged_sample[ , final_top_genes]
+colnames(final_train) <- make.names(colnames(final_train))
+final_train$Group <- as.factor(group_merged)
+
+
+# final model
+final_model <- randomForest(Group ~ .,
+                           data = final_train,
+                           ntree = 50,
+                           importance = TRUE)
+```
+
+
+
+plot the graph for the importance
+```{r}
+importance_data <- as.data.frame(importance(final_model))
+rownames(importance_data) <- sub("^X", "", rownames(importance_data))
+genes_grade <- importance_data %>% arrange(desc(abs(`MyocardialInfarction`)))
+genes_grade$Gene <- rownames(genes_grade)
+
+plot_genes <- head(genes_grade, 20)
+
+ggplot(plot_genes, aes(x = abs(MyocardialInfarction), 
+                       y = reorder(Gene, abs(MyocardialInfarction)))) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Top Genes by Impact on Myocardial Infarction",
+       x = "Absolute Importance (Myocardial Infarction)",
+       y = "Gene") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8)) +
+  coord_cartesian(xlim = c(0, max(abs(genes_grade$MyocardialInfarction)) * 1.1))
+```
+
+
+
+```{r}
+genes_order <- rownames(genes_grade)
+merged_sample$Group <- group_merged
+
+control_group <- merged_sample %>% filter(Group == "Control")
+valid_genes_control <- intersect(genes_order, colnames(control_group))
+control_group <- control_group[, valid_genes_control, drop = FALSE]
+
+
+ami_group <- merged_sample %>% filter(Group == "MyocardialInfarction")
+valid_genes_ami <- intersect(genes_order, colnames(ami_group))
+ami_group <- ami_group[, valid_genes_ami, drop = FALSE]
+
+
+
+
+
+reference_range <- control_group %>%
+  summarise_all(list(
+    mean = ~mean(.),
+    sd = ~sd(.),
+    lower = ~quantile(., probs = 0.025),
+    upper = ~quantile(., probs = 0.975)
+  )) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("Gene", ".value"),
+    names_pattern = "(.*)_(mean|sd|lower|upper)"
+  ) %>%
+  mutate(
+    mean = round(mean, 5),
+    sd = round(sd, 5),
+    Reference_Range = sprintf("[%.5f, %.5f]", lower, upper)
+  ) %>%
+  select(Gene, Mean = mean, SD = sd, Reference_Range)
+
+reference_range
+
+
+
+
+
+# Visualize distribution for top genes (e.g., top 5 from genes_grade)
+common_valid_genes <- intersect(valid_genes_control, valid_genes_ami)
+top_genes <- common_valid_genes
+plot_list <- list()
+
+
+for (gene in top_genes) {
+  combined_data <- rbind(
+    data.frame(Value = control_group[[gene]], Group = "Control"),
+    data.frame(Value = ami_group[[gene]], Group = "AMI")
+  )
+  p <- ggplot(combined_data, aes(x = Value, fill = Group)) +
+    geom_density(alpha = 0.5) +
+    labs(title = paste("Distribution of", gene),
+         x = "Expression Value",
+         y = "Density") +
+    scale_fill_manual(values = c("Control" = "blue", "AMI" = "red")) +
+    theme_minimal()
+  plot_list[[gene]] <- p
+}
+```
+
+
+```{r}
+save(final_model, genes_grade, genes_order, reference_range, control_group, ami_group, file = "shiny_model_data.RData")
+write.csv(t(sample_1), file = "GSE48060.csv", row.names = TRUE)
+```
+
+

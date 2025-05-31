@@ -1,0 +1,312 @@
+---
+title: "Myocardial Infarction Gene Analysis"
+author: "BIO GROUP04"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r, include=FALSE}
+library(shiny)
+library(DT)
+library(data.table)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(randomForest)
+library(shinythemes)
+
+options(shiny.maxRequestSize = 50 * 1024^2)
+```
+
+```{r, echo=FALSE, results='hide'}
+load("shiny_model_data.RData")
+```
+
+```{r, echo=FALSE}
+custom_css <- "
+  html, body, .container-fluid {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow-x: hidden;
+  }
+  body {
+    font-family: 'Arial', sans-serif;
+    background-color: #f4f6f9;
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
+  .title-panel {
+    background: linear-gradient(90deg, #007bff, #00c4b4);
+    color: white;
+    padding: 15px;
+    border-radius: 8px;
+    text-align: center;
+    margin-bottom: 20px;
+  }
+  .sidebar {
+    background-color: #ffffff;
+    border-radius: 8px;
+    padding: 15px;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+    min-height: 80vh;
+    overflow-y: auto;
+  }
+  .main-panel {
+    background-color: #ffffff;
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+    min-height: 80vh;
+    overflow-y: auto;
+  }
+  .tab-content {
+    flex: 1 1 auto;
+    overflow-y: auto;
+  }
+  .btn {
+    border-radius: 5px;
+    transition: background-color 0.3s;
+  }
+  .btn:hover {
+    opacity: 0.9;
+  }
+  .dataTables_wrapper {
+    margin-top: 10px;
+  }
+  h4 {
+    color: #007bff;
+    font-weight: bold;
+  }
+  .plot-container {
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    padding: 10px;
+    background-color: #fff;
+  }
+"
+
+
+ui <- fluidPage(
+  theme = shinytheme("flatly"),
+  tags$head(tags$style(HTML(custom_css))),
+  
+  titlePanel(
+    div(class = "title-panel", "Myocardial Infarction Gene Expression Analysis")
+  ),
+  
+  tabsetPanel(
+    tabPanel(
+      "Upload & View Expression Data",
+      sidebarLayout(
+        sidebarPanel(
+          class = "sidebar",
+          fileInput("file1", "Upload Expression CSV File (Genes x Samples)",
+                    accept = c(".csv")),
+          helpText("Upload the raw expression data matrix (genes as rows, samples as columns).")
+        ),
+        mainPanel(
+          class = "main-panel",
+          DTOutput("expr_table")
+        )
+      )
+    ),
+    
+    tabPanel(
+      "Patient Prediction & Data",
+      sidebarLayout(
+        sidebarPanel(
+          class = "sidebar",
+          uiOutput("patient_select_ui")
+        ),
+        mainPanel(
+          class = "main-panel",
+          div(class = "plot-container", plotOutput("pie_pred", height = "400px")),
+          h4("Patient Gene Expression & Reference Range"),
+          DTOutput("patient_gene_table"),
+          hr(),
+          h4("Reference Ranges for Genes"),
+          DTOutput("reference_table")
+        )
+      )
+    ),
+    
+    tabPanel(
+      "Gene Importance & Distribution",
+      sidebarLayout(
+        sidebarPanel(
+          class = "sidebar",
+          selectInput("selected_gene", "Select a Gene for Density Plot:",
+                      choices = genes_order, selected = genes_order[1])
+        ),
+        mainPanel(
+          class = "main-panel",
+          div(class = "plot-container", plotOutput("importance_plot", height = "400px")),
+          hr(),
+          div(class = "plot-container", plotOutput("gene_density_plot", height = "400px"))
+        )
+      )
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  # Reactive expression to read csv
+  expr_data_raw <- reactive({
+    req(input$file1)
+    df <- tryCatch(fread(input$file1$datapath), error = function(e) NULL)
+    validate(need(!is.null(df), "Error reading the CSV file. Please ensure it's a valid CSV."))
+    return(df)
+  })
+  
+  # Render raw expression data table
+  output$expr_table <- renderDT({
+    df <- expr_data_raw()
+    
+    df <- as.data.frame(df)
+    df[sapply(df, is.numeric)] <- round(df[sapply(df, is.numeric)], 5)
+    
+    datatable(df, options = list(
+      scrollX = TRUE,
+      scrollY = "600px",
+      pageLength = 50,
+      lengthMenu = c(10, 25, 50, 100, 1000),
+      dom = 'Bfrtip',
+      buttons = c('copy', 'csv', 'excel')
+    ), 
+    rownames = FALSE)
+  })
+  
+  # Transpose expression data for downstream use
+  expr_data_transposed <- reactive({
+    df <- expr_data_raw()
+    if (is.character(df[[1]]) && all(duplicated(df[[1]]) == FALSE)) {
+      gene_names <- df[[1]]
+      df_mat <- as.matrix(df[, -1])
+      rownames(df_mat) <- gene_names
+      t_df <- as.data.frame(t(df_mat))
+    } else {
+      t_df <- as.data.frame(t(as.matrix(df)))
+    }
+    colnames(t_df) <- make.names(colnames(t_df))
+    return(t_df)
+  })
+  
+  # Patient selection dropdown
+  output$patient_select_ui <- renderUI({
+    df <- expr_data_transposed()
+    req(df)
+    selectInput("selected_patient", "Select a Patient Sample:", choices = rownames(df))
+  })
+  
+  # Pie chart for patient prediction
+  output$pie_pred <- renderPlot({
+    req(input$selected_patient)
+    df <- expr_data_transposed()
+    patient_data <- df[input$selected_patient, , drop = FALSE]
+    
+    pred_prob <- predict(final_model, patient_data, type = "prob")
+    
+    prob_df <- data.frame(
+      Group = colnames(pred_prob),
+      Probability = as.numeric(pred_prob[1, ])
+    )
+    
+    ggplot(prob_df, aes(x = "", y = Probability, fill = Group)) +
+      geom_bar(stat = "identity", width = 1) +
+      coord_polar("y") +
+      geom_text(aes(label = scales::percent(Probability, accuracy = 0.1)),
+                position = position_stack(vjust = 0.5), size = 5) +
+      labs(title = paste("Disease Probability for Patient:", input$selected_patient),
+           fill = "Group") +
+      theme_void() +
+      theme(legend.position = "right",
+            plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+            legend.title = element_text(size = 12),
+            legend.text = element_text(size = 10))
+  })
+  
+  # Patient gene expression table
+  output$patient_gene_table <- renderDT({
+    req(input$selected_patient)
+    df <- expr_data_transposed()
+    patient_data <- df[input$selected_patient, , drop = FALSE]
+    patient_data <- round(patient_data, 5)
+    
+    top_genes_clean <- make.names(genes_order)
+    valid_genes <- intersect(top_genes_clean, colnames(patient_data))
+    patient_top_genes <- patient_data[, valid_genes, drop = FALSE]
+    
+    datatable(patient_top_genes, 
+              options = list(scrollX = TRUE, pageLength = 15),
+              caption = htmltools::tags$caption(
+                style = 'caption-side: top; text-align: left; font-weight: bold;',
+                paste("Patient", input$selected_patient, "Top Genes Expression")
+              ))
+  })
+  
+  # Reference ranges table
+  output$reference_table <- renderDT({
+    datatable(reference_range,
+              options = list(scrollX = TRUE, pageLength = 20),
+              rownames = FALSE)
+  })
+  
+  # Gene importance plot
+  output$importance_plot <- renderPlot({
+    importance_data <- as.data.frame(importance(final_model))
+    rownames(importance_data) <- sub("^X", "", rownames(importance_data))
+    genes_grade <- importance_data %>% arrange(desc(abs(`MyocardialInfarction`)))
+    genes_grade$Gene <- rownames(genes_grade)
+    
+    plot_genes <- head(genes_grade, 20)
+    
+    ggplot(plot_genes, aes(x = abs(MyocardialInfarction), 
+                           y = reorder(Gene, abs(MyocardialInfarction)))) +
+      geom_bar(stat = "identity", fill = "#007bff") +
+      labs(title = "Top Genes by Impact on Myocardial Infarction",
+           x = "Absolute Importance",
+           y = "Gene") +
+      theme_minimal() +
+      theme(axis.text.y = element_text(size = 10),
+            plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+            axis.title = element_text(size = 12)) +
+      coord_cartesian(xlim = c(0, max(abs(genes_grade$MyocardialInfarction)) * 1.1))
+  })
+  
+  # Gene density plot
+  output$gene_density_plot <- renderPlot({
+    req(input$selected_gene)
+    gene <- input$selected_gene
+    
+    if (!(gene %in% colnames(control_group)) || !(gene %in% colnames(ami_group))) {
+      plot.new()
+      title(main = paste("Gene", gene, "not found in control or AMI groups"), cex.main = 1.5)
+      return()
+    }
+    
+    combined_data <- rbind(
+      data.frame(Value = control_group[[gene]], Group = "Control"),
+      data.frame(Value = ami_group[[gene]], Group = "AMI")
+    )
+    
+    ggplot(combined_data, aes(x = Value, fill = Group)) +
+      geom_density(alpha = 0.5) +
+      labs(title = paste("Expression Distribution of", gene),
+           x = "Expression Value",
+           y = "Density") +
+      scale_fill_manual(values = c("Control" = "#007bff", "AMI" = "#dc3545")) +
+      theme_minimal() +
+      theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+            axis.title = element_text(size = 12),
+            legend.position = "top",
+            legend.title = element_text(size = 12),
+            legend.text = element_text(size = 10))
+  })
+}
+
+shinyApp(ui, server)
+```
+
